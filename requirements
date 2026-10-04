@@ -1,0 +1,12 @@
+streamlit>=1.40
+streamlit-image-coordinates>=0.1.9
+numpy>=1.26
+scipy>=1.11
+scikit-image>=0.22
+opencv-python-headless>=4.9
+pandas>=2.1
+plotly>=5.18
+pillow>=10.0
+reportlab>=4.0
+openpyxl>=3.1
+pytest>=8.0
