@@ -1116,18 +1116,20 @@ def save_analysis(
     summary: dict,
     oversize_threshold_mm: float | None,
     size_basis: str,
+    segmentation_config: dict | None = None,
 ) -> str:
     analysis_id = _new_id()
     particles_json = json.dumps([_particle_to_dict(p) for p in particles])
     with get_connection() as conn:
         conn.execute(
             """INSERT INTO analyses
-               (id, image_id, blast_id, calibration_id, particles_json, summary_json,
-                oversize_threshold_mm, size_basis, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, image_id, blast_id, calibration_id, segmentation_config_json,
+                particles_json, summary_json, oversize_threshold_mm, size_basis, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                analysis_id, image_id, blast_id, calibration_id, particles_json,
-                json.dumps(summary), oversize_threshold_mm, size_basis, _now(),
+                analysis_id, image_id, blast_id, calibration_id,
+                json.dumps(segmentation_config) if segmentation_config else None,
+                particles_json, json.dumps(summary), oversize_threshold_mm, size_basis, _now(),
             ),
         )
     return analysis_id
@@ -1158,7 +1160,41 @@ def get_analysis(analysis_id: str) -> dict | None:
     d = dict(row)
     d["summary"] = json.loads(d.pop("summary_json") or "{}")
     d["particles"] = json.loads(d.pop("particles_json") or "[]")
+    d["segmentation_config"] = json.loads(d.pop("segmentation_config_json") or "null")
     return d
+
+
+def get_latest_analysis_for_image(image_id: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM analyses WHERE image_id = ? ORDER BY created_at DESC LIMIT 1",
+            (image_id,),
+        ).fetchone()
+    return get_analysis(row["id"]) if row else None
+
+
+def get_latest_analyses_for_blast(blast_id: str) -> dict:
+    """One analysis per image: the most recently saved one. Images with no
+    saved analysis at all are simply absent from the result, since there is
+    nothing to roll up for them yet.
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, image_id FROM analyses WHERE blast_id = ? ORDER BY created_at DESC",
+            (blast_id,),
+        ).fetchall()
+    latest_by_image: dict[str, dict] = {}
+    for row in rows:
+        if row["image_id"] in latest_by_image:
+            continue
+        latest_by_image[row["image_id"]] = get_analysis(row["id"])
+    return latest_by_image
+
+
+def get_calibration(calibration_id: str) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM calibrations WHERE id = ?", (calibration_id,)).fetchone()
+    return dict(row) if row else None
 
 
 def _particle_to_dict(p) -> dict:
@@ -1169,14 +1205,142 @@ def _particle_to_dict(p) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Blast-level aggregation (multi-image rollup)
+# ---------------------------------------------------------------------------
+@dataclass
+class ImageContribution:
+    image_id: str
+    original_filename: str
+    stored_filename: str
+    particle_count: int
+    area_mm2: float
+    mean_circularity: float
+
+
+@dataclass
+class BlastAggregate:
+    combined_df: pd.DataFrame
+    included: list[ImageContribution]
+    skipped: list[tuple[str, str]]  # (filename, reason)
+
+    @property
+    def is_empty(self) -> bool:
+        return self.combined_df.empty
+
+
+def aggregate_blast_particles(blast_id: str, image_ids: list[str] | None = None) -> BlastAggregate:
+    """Pool kept particles from every analyzed image in a blast into one
+    dataframe, in physical units. One row per particle, so this is the
+    thing that scales to thousands of rows across many images - everything
+    downstream (concat, column math) is pandas/numpy vectorized rather than
+    a python loop over particles.
+    """
+    images_by_id = {img["id"]: img for img in list_images(blast_id)}
+    latest_analyses = get_latest_analyses_for_blast(blast_id)
+
+    candidate_ids = image_ids if image_ids is not None else list(images_by_id.keys())
+
+    frames: list[pd.DataFrame] = []
+    included: list[ImageContribution] = []
+    skipped: list[tuple[str, str]] = []
+
+    for image_id in candidate_ids:
+        image = images_by_id.get(image_id)
+        if image is None:
+            continue
+        analysis = latest_analyses.get(image_id)
+        if analysis is None:
+            skipped.append((image["original_filename"], "not analyzed yet"))
+            continue
+
+        calibration = get_calibration(analysis["calibration_id"]) if analysis.get("calibration_id") else None
+        if not calibration or not calibration["is_valid"]:
+            skipped.append((image["original_filename"], "no valid calibration"))
+            continue
+        scale = calibration["scale_mm_per_px"]
+
+        df = pd.DataFrame(analysis["particles"])
+        if df.empty:
+            skipped.append((image["original_filename"], "no particles recorded"))
+            continue
+        df = df[df["kept"]].copy()
+        if df.empty:
+            skipped.append((image["original_filename"], "all particles removed"))
+            continue
+
+        df["equiv_diameter_mm"] = df["equiv_diameter_px"] * scale
+        df["area_mm2"] = df["area_px"] * (scale ** 2)
+        df["source_image_id"] = image_id
+        df["source_image"] = image["original_filename"]
+        frames.append(df)
+
+        included.append(ImageContribution(
+            image_id=image_id,
+            original_filename=image["original_filename"],
+            stored_filename=image["stored_filename"],
+            particle_count=int(len(df)),
+            area_mm2=float(df["area_mm2"].sum()),
+            mean_circularity=float(df["circularity"].mean()),
+        ))
+
+    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["equiv_diameter_mm", "area_mm2", "circularity", "source_image"]
+    )
+    return BlastAggregate(combined_df=combined, included=included, skipped=skipped)
+
+
+@dataclass
+class AggregateSummary:
+    particle_count: int
+    total_area_mm2: float
+    mean_circularity: float
+    dist: CumulativeDistribution
+    d_values: dict[str, float]
+    rosin_rammler: RosinRammlerFit | None
+
+
+def compute_aggregate_summary(aggregate: BlastAggregate, basis: SizeBasis) -> AggregateSummary | None:
+    if aggregate.is_empty:
+        return None
+    df = aggregate.combined_df
+    sizes = df["equiv_diameter_mm"].to_numpy()
+    areas = df["area_mm2"].to_numpy()
+    weights = areas if basis is SizeBasis.AREA else None
+
+    dist = build_cumulative_distribution(sizes.tolist(), weights.tolist() if weights is not None else None, basis)
+    dv = d_values(dist)
+    fit = fit_rosin_rammler(dist)
+
+    return AggregateSummary(
+        particle_count=int(len(df)),
+        total_area_mm2=float(areas.sum()),
+        mean_circularity=float(df["circularity"].mean()),
+        dist=dist,
+        d_values=dv,
+        rosin_rammler=fit,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Session state helpers
 # ---------------------------------------------------------------------------
+DEFAULT_SEG_CONFIG_UI = {
+    "threshold_mode": "otsu",
+    "min_distance": 15,
+    "morph_kernel": 3,
+    "invert": True,
+    "min_area": 16.0,
+    "max_aspect": 6.0,
+    "min_confidence": 0.5,
+}
+
 DEFAULTS = {
     "current_blast_id": None,
     "current_image_id": None,
-    "label_image": None,
-    "particles": None,
-    "segmentation_config": None,
+    "selected_image_ids": [],
+    "particles_by_image": {},
+    "labels_by_image": {},
+    "seg_config_by_image": {},
     "calibration_points": [],
 }
 
@@ -1184,7 +1348,7 @@ DEFAULTS = {
 def init_state() -> None:
     for key, value in DEFAULTS.items():
         if key not in st.session_state:
-            st.session_state[key] = value
+            st.session_state[key] = dict(value) if isinstance(value, dict) else (list(value) if isinstance(value, list) else value)
 
 
 def load_image_bgr(stored_filename: str) -> np.ndarray | None:
@@ -1213,9 +1377,38 @@ def get_current_image() -> dict | None:
     return get_image(st.session_state["current_image_id"])
 
 
-def reset_analysis_state() -> None:
-    st.session_state["label_image"] = None
-    st.session_state["particles"] = None
+def get_particles_for_image(image_id: str) -> list | None:
+    return st.session_state["particles_by_image"].get(image_id)
+
+
+def set_particles_for_image(image_id: str, particles: list) -> None:
+    st.session_state["particles_by_image"][image_id] = particles
+
+
+def get_label_image(image_id: str) -> np.ndarray | None:
+    return st.session_state["labels_by_image"].get(image_id)
+
+
+def set_label_image(image_id: str, labels: np.ndarray) -> None:
+    st.session_state["labels_by_image"][image_id] = labels
+
+
+def get_seg_config_for_image(image_id: str) -> dict:
+    return st.session_state["seg_config_by_image"].get(image_id, DEFAULT_SEG_CONFIG_UI.copy())
+
+
+def set_seg_config_for_image(image_id: str, config: dict) -> None:
+    st.session_state["seg_config_by_image"][image_id] = config
+
+
+def reset_image_working_state(image_id: str) -> None:
+    """Clear cached (unsaved) segmentation results for one image - used
+    when switching to a freshly selected image so a previous image's
+    particles don't linger on screen before segmentation has run for this
+    one. Nothing is deleted from the database.
+    """
+    st.session_state["particles_by_image"].pop(image_id, None)
+    st.session_state["labels_by_image"].pop(image_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1282,7 +1475,7 @@ def render_blasts() -> None:
             blast_id = create_blast(fields)
             st.session_state["current_blast_id"] = blast_id
             st.session_state["current_image_id"] = None
-            reset_analysis_state()
+            st.session_state["selected_image_ids"] = []
             st.success(f"Created blast '{name}'.")
             st.rerun()
 
@@ -1307,7 +1500,7 @@ def render_blasts() -> None:
             if st.button("Select" if not is_current else "Selected", key=f"select_{blast['id']}", disabled=is_current):
                 st.session_state["current_blast_id"] = blast["id"]
                 st.session_state["current_image_id"] = None
-                reset_analysis_state()
+                st.session_state["selected_image_ids"] = [img["id"] for img in images]
                 st.rerun()
         with cols[2]:
             if is_current:
@@ -1340,10 +1533,11 @@ def render_upload() -> None:
             except UploadValidationError as exc:
                 st.error(f"{file.name}: {exc}")
                 continue
-            add_image(
+            new_image_id = add_image(
                 blast["id"], stored.original_filename, stored.stored_filename,
                 stored.width_px, stored.height_px, stored.quality_warnings,
             )
+            st.session_state["selected_image_ids"].append(new_image_id)
             uploaded_count += 1
         if uploaded_count:
             st.success(f"Uploaded {uploaded_count} image(s).")
@@ -1368,7 +1562,6 @@ def render_upload() -> None:
             is_current = image["id"] == st.session_state.get("current_image_id")
             if st.button("Selected" if is_current else "Select", key=f"select_img_{image['id']}", disabled=is_current, width="stretch"):
                 st.session_state["current_image_id"] = image["id"]
-                reset_analysis_state()
                 st.rerun()
 
 
@@ -1416,8 +1609,6 @@ def render_calibrate() -> None:
     scale = min(1.0, DISPLAY_WIDTH / image["width_px"])
     display_w = int(image["width_px"] * scale)
     display_h = int(image["height_px"] * scale)
-
-    from PIL import Image as PILImage
 
     pil_img = PILImage.fromarray(rgb).resize((display_w, display_h))
 
@@ -1478,22 +1669,59 @@ def render_segment() -> None:
         st.warning("Select an image on the Upload page first.")
         return
 
+    image_id = image["id"]
     image_bgr = load_image_bgr(image["stored_filename"])
     if image_bgr is None:
         st.error("Stored image file is missing.")
         return
 
+    st.caption(f"Editing **{image['original_filename']}** - settings and particles below belong only to this image.")
+
+    saved_config = get_seg_config_for_image(image_id)
+
     with st.sidebar:
         st.subheader("Segmentation settings")
-        threshold_mode = st.selectbox("Threshold mode", ["otsu", "adaptive"])
-        min_distance = st.slider("Minimum distance between particle centers (px)", 3, 60, 15)
-        morph_kernel = st.slider("Morphological kernel size", 1, 9, 3, step=2)
-        invert = st.checkbox("Invert threshold (rocks lighter than background)", value=True)
+        threshold_mode = st.selectbox(
+            "Threshold mode", ["otsu", "adaptive"],
+            index=["otsu", "adaptive"].index(saved_config["threshold_mode"]),
+            key=f"threshold_mode_{image_id}",
+        )
+        min_distance = st.slider(
+            "Minimum distance between particle centers (px)", 3, 60,
+            saved_config["min_distance"], key=f"min_distance_{image_id}",
+        )
+        morph_kernel = st.slider(
+            "Morphological kernel size", 1, 9, saved_config["morph_kernel"],
+            step=2, key=f"morph_kernel_{image_id}",
+        )
+        invert = st.checkbox(
+            "Invert threshold (rocks lighter than background)",
+            value=saved_config["invert"], key=f"invert_{image_id}",
+        )
 
         st.subheader("Quality-control thresholds")
-        min_area = st.number_input("Minimum particle area (px)", min_value=1.0, value=16.0)
-        max_aspect = st.number_input("Maximum aspect ratio", min_value=1.0, value=6.0)
-        min_confidence = st.slider("Minimum confidence", 0.0, 1.0, 0.5)
+        min_area = st.number_input(
+            "Minimum particle area (px)", min_value=1.0,
+            value=saved_config["min_area"], key=f"min_area_{image_id}",
+        )
+        max_aspect = st.number_input(
+            "Maximum aspect ratio", min_value=1.0,
+            value=saved_config["max_aspect"], key=f"max_aspect_{image_id}",
+        )
+        min_confidence = st.slider(
+            "Minimum confidence", 0.0, 1.0, saved_config["min_confidence"],
+            key=f"min_confidence_{image_id}",
+        )
+
+    current_config = {
+        "threshold_mode": threshold_mode,
+        "min_distance": min_distance,
+        "morph_kernel": morph_kernel,
+        "invert": invert,
+        "min_area": min_area,
+        "max_aspect": max_aspect,
+        "min_confidence": min_confidence,
+    }
 
     if st.button("Run segmentation", type="primary"):
         config = SegmentationConfig(
@@ -1507,12 +1735,13 @@ def render_segment() -> None:
         qc = QCThresholds(min_area_px=min_area, max_aspect_ratio=max_aspect, min_confidence=min_confidence)
         particles = measure_particles_from_labels(labels, confidences, qc)
 
-        st.session_state["label_image"] = labels
-        st.session_state["particles"] = particles
-        st.success(f"Found {len(particles)} particle(s).")
+        set_label_image(image_id, labels)
+        set_particles_for_image(image_id, particles)
+        set_seg_config_for_image(image_id, current_config)
+        st.success(f"Found {len(particles)} particle(s) in {image['original_filename']}.")
 
-    particles = st.session_state.get("particles")
-    labels = st.session_state.get("label_image")
+    particles = get_particles_for_image(image_id)
+    labels = get_label_image(image_id)
 
     if particles is None or labels is None:
         st.info("Run segmentation to see results here.")
@@ -1522,25 +1751,24 @@ def render_segment() -> None:
     col_display, col_table = st.columns([3, 2])
 
     with col_display:
-        show_boundaries = st.checkbox("Show boundaries", value=True)
-        show_ids = st.checkbox("Show particle IDs", value=False)
+        show_boundaries = st.checkbox("Show boundaries", value=True, key=f"show_boundaries_{image_id}")
+        show_ids = st.checkbox("Show particle IDs", value=False, key=f"show_ids_{image_id}")
         annotated = draw_annotations(image_bgr, labels, particles, show_boundaries, show_ids)
         annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
         st.image(annotated_rgb, width="stretch", caption="Detected particles (red outline = flagged)")
 
         st.markdown("**Add a missed particle** - click its center, then set a radius and confirm.")
-        from PIL import Image as PILImage
 
         scale = min(1.0, DISPLAY_WIDTH / image["width_px"])
         display_img = PILImage.fromarray(annotated_rgb).resize(
             (int(image["width_px"] * scale), int(image["height_px"] * scale))
         )
-        click = streamlit_image_coordinates(display_img, key="add_particle_click")
-        radius = st.slider("Estimated radius (px)", 3, 200, 20)
+        click = streamlit_image_coordinates(display_img, key=f"add_particle_click_{image_id}")
+        radius = st.slider("Estimated radius (px)", 3, 200, 20, key=f"add_radius_{image_id}")
         if click is not None and st.button("Add particle at last click"):
             center = (click["x"] / scale, click["y"] / scale)
             add_manual_particle(particles, center, float(radius))
-            st.session_state["particles"] = particles
+            set_particles_for_image(image_id, particles)
             st.rerun()
 
     with col_table:
@@ -1550,27 +1778,131 @@ def render_segment() -> None:
             hide_index=True,
             disabled=["particle_id", "equiv_diameter_px", "circularity", "flags"],
             width="stretch",
-            key="particle_editor",
+            key=f"particle_editor_{image_id}",
         )
         if st.button("Apply keep/remove changes"):
             kept_map = dict(zip(edited["particle_id"], edited["kept"]))
             for p in particles:
                 if p.particle_id in kept_map:
                     p.kept = bool(kept_map[p.particle_id])
-            st.session_state["particles"] = particles
+            set_particles_for_image(image_id, particles)
             st.rerun()
 
         st.markdown("**Merge particles**")
         ids = [p.particle_id for p in particles]
-        to_merge = st.multiselect("Select two or more IDs to merge", ids)
+        to_merge = st.multiselect("Select two or more IDs to merge", ids, key=f"merge_select_{image_id}")
         if st.button("Merge selected", disabled=len(to_merge) < 2):
             merge_particles(particles, to_merge)
-            st.session_state["particles"] = particles
+            set_particles_for_image(image_id, particles)
             st.rerun()
 
         removed = sum(1 for p in particles if not p.kept)
         added = sum(1 for p in particles if p.provenance.value == "manual_added")
         st.caption(f"{len(particles)} total - {removed} removed - {added} manually added")
+
+
+# ---------------------------------------------------------------------------
+# Page: Blast overview
+# ---------------------------------------------------------------------------
+def render_overview() -> None:
+    st.title("Blast Overview")
+    blast = get_current_blast()
+    if blast is None:
+        st.warning("Select a blast first, on the Blasts page.")
+        return
+
+    all_images = list_images(blast["id"])
+    if not all_images:
+        st.info("No images uploaded to this blast yet.")
+        return
+
+    selected_ids = [
+        i for i in st.session_state["selected_image_ids"]
+        if i in {img["id"] for img in all_images}
+    ]
+    st.caption(
+        f"Rolling up {len(selected_ids)} of {len(all_images)} image(s) in **{blast['name']}** - "
+        "change which images are included from the sidebar checklist."
+    )
+    if not selected_ids:
+        st.info("No images selected for this overview. Check some in the sidebar.")
+        return
+
+    basis_label = st.radio("Distribution weighting", ["Area (recommended)", "Number"], horizontal=True, key="overview_basis")
+    basis = SizeBasis.AREA if basis_label.startswith("Area") else SizeBasis.NUMBER
+
+    aggregate = aggregate_blast_particles(blast["id"], selected_ids)
+
+    if aggregate.skipped:
+        with st.expander(f"{len(aggregate.skipped)} image(s) excluded from this rollup"):
+            for filename, reason in aggregate.skipped:
+                st.write(f"- **{filename}**: {reason}")
+
+    if not aggregate.included:
+        st.warning("None of the selected images have a saved, calibrated analysis to roll up yet.")
+        return
+
+    summary = compute_aggregate_summary(aggregate, basis)
+
+    st.subheader("Combined metrics")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Images included", len(aggregate.included))
+    c2.metric("Total particle count", summary.particle_count)
+    c3.metric("Total area analyzed (mm2)", f"{summary.total_area_mm2:,.0f}")
+    c4.metric("Mean circularity", f"{summary.mean_circularity:.3f}")
+
+    st.subheader(f"Combined D-values (mm, {basis.value}-weighted)")
+    dv_cols = st.columns(len(summary.d_values))
+    for col, (key, value) in zip(dv_cols, summary.d_values.items()):
+        col.metric(key, f"{value:.1f}")
+
+    st.subheader("Combined cumulative passing curve")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=summary.dist.sizes_sorted, y=summary.dist.cumulative_passing_pct,
+        mode="lines", name="Combined (empirical)", line=dict(color="#38BDF8", width=2),
+    ))
+    if summary.rosin_rammler is not None:
+        fit = summary.rosin_rammler
+        x_fit = np.linspace(min(summary.dist.sizes_sorted), max(summary.dist.sizes_sorted), 200)
+        y_fit = 100 * (1 - np.exp(-((x_fit / fit.xc) ** fit.n)))
+        fig.add_trace(go.Scatter(
+            x=x_fit, y=y_fit, mode="lines", name="Rosin-Rammler fit",
+            line=dict(color="#FFFFFF", width=2, dash="dash"),
+        ))
+        st.caption(f"Rosin-Rammler: Xc = {fit.xc:.1f} mm, n = {fit.n:.2f}, R2 = {fit.r_squared:.3f}")
+    fig.update_layout(
+        xaxis_title="Particle size (mm)", yaxis_title="Cumulative passing (%)",
+        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=-0.2),
+    )
+    st.plotly_chart(fig, width="stretch")
+    st.caption(
+        "The combined curve pools particles from every included image, weighted by the basis "
+        "above, so each image contributes in proportion to its own area or particle count. This "
+        "assumes each photo samples the muckpile without systematic bias - treat it as an "
+        "estimate, not a sieve result."
+    )
+
+    st.subheader("Images in this overview")
+    images_by_id = {img["id"]: img for img in all_images}
+    contrib_by_id = {c.image_id: c for c in aggregate.included}
+    cols = st.columns(4)
+    for idx, image_id in enumerate(selected_ids):
+        image = images_by_id.get(image_id)
+        if image is None:
+            continue
+        with cols[idx % 4]:
+            thumb_path = f"{UPLOAD_DIR}/{image['stored_filename']}"
+            st.image(thumb_path, width="stretch")
+            contribution = contrib_by_id.get(image_id)
+            if contribution:
+                st.caption(
+                    f"{image['original_filename']}\n\n"
+                    f"{contribution.particle_count} particles - {contribution.area_mm2:,.0f} mm2"
+                )
+            else:
+                st.caption(f"{image['original_filename']} - not in rollup")
 
 
 # ---------------------------------------------------------------------------
@@ -1590,7 +1922,7 @@ def render_results() -> None:
     st.title("Fragmentation Results")
     blast = get_current_blast()
     image = get_current_image()
-    particles = st.session_state.get("particles")
+    particles = get_particles_for_image(image["id"]) if image else None
 
     if blast is None or image is None:
         st.warning("Select a blast and image first.")
@@ -1639,8 +1971,6 @@ def render_results() -> None:
 
     fit = fit_rosin_rammler(dist)
     if fit is not None:
-        import numpy as np
-
         x_fit = np.linspace(min(dist.sizes_sorted), max(dist.sizes_sorted), 200)
         y_fit = 100 * (1 - np.exp(-((x_fit / fit.xc) ** fit.n)))
         fig.add_trace(go.Scatter(
@@ -1701,81 +2031,111 @@ def render_results() -> None:
             image["id"], blast["id"],
             calibration_record["id"] if calibration_record else None,
             particles, summary, oversize_threshold, basis.value,
+            segmentation_config=get_seg_config_for_image(image["id"]),
         )
-        st.success("Analysis saved. It will now appear on the Compare Blasts page.")
+        st.success("Analysis saved. It now feeds Blast Overview and Blast Comparison.")
 
 
 # ---------------------------------------------------------------------------
-# Page: Compare blasts
+# Page: Blast comparison
 # ---------------------------------------------------------------------------
-def render_compare() -> None:
+def render_comparison() -> None:
     st.title("Blast Comparison")
+    st.caption("Compares the full, multi-image fragmentation profile of one blast against another.")
 
-    blasts = {b["id"]: b["name"] for b in list_blasts()}
-    analyses = list_analyses()
-    if not analyses:
-        st.info("No saved analyses yet. Save one from the Results page first.")
+    blasts = list_blasts()
+    blasts_with_data = [b for b in blasts if get_latest_analyses_for_blast(b["id"])]
+    if len(blasts_with_data) < 2:
+        st.info("Save at least one analysis in each of two different blasts first.")
         return
 
-    labels = {}
-    for a in analyses:
-        blast_name = blasts.get(a["blast_id"], "unknown blast")
-        labels[a["id"]] = f"{blast_name} - {a['created_at'][:19]}"
+    names = {b["id"]: b["name"] for b in blasts_with_data}
+    col_a, col_b = st.columns(2)
+    with col_a:
+        blast_a_id = st.selectbox("Blast A", list(names.keys()), format_func=lambda i: names[i], key="compare_blast_a")
+    with col_b:
+        remaining = [bid for bid in names if bid != blast_a_id]
+        blast_b_id = st.selectbox("Blast B", remaining, format_func=lambda i: names[i], key="compare_blast_b")
 
-    selected = st.multiselect(
-        "Select two or more analyses to compare",
-        options=list(labels.keys()),
-        format_func=lambda aid: labels[aid],
+    basis_label = st.radio("Distribution weighting", ["Area (recommended)", "Number"], horizontal=True, key="compare_basis")
+    basis = SizeBasis.AREA if basis_label.startswith("Area") else SizeBasis.NUMBER
+
+    agg_a = aggregate_blast_particles(blast_a_id)
+    agg_b = aggregate_blast_particles(blast_b_id)
+    summary_a = compute_aggregate_summary(agg_a, basis)
+    summary_b = compute_aggregate_summary(agg_b, basis)
+
+    if summary_a is None or summary_b is None:
+        st.warning("One of the selected blasts has no analyzed, calibrated images to compare.")
+        return
+
+    for name, agg in [(names[blast_a_id], agg_a), (names[blast_b_id], agg_b)]:
+        if agg.skipped:
+            reasons = ", ".join(f"{fname} ({reason})" for fname, reason in agg.skipped)
+            st.caption(f"{name}: excluded from the rollup - {reasons}")
+
+    st.subheader("Cumulative passing curve")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=summary_a.dist.sizes_sorted, y=summary_a.dist.cumulative_passing_pct,
+        mode="lines", name=names[blast_a_id], line=dict(color="#38BDF8", width=2),
+    ))
+    fig.add_trace(go.Scatter(
+        x=summary_b.dist.sizes_sorted, y=summary_b.dist.cumulative_passing_pct,
+        mode="lines", name=names[blast_b_id], line=dict(color="#F5F7FA", width=2, dash="dash"),
+    ))
+    fig.update_layout(
+        xaxis_title="Particle size (mm)", xaxis_type="log",
+        yaxis_title="Cumulative passing (%)",
+        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=-0.2),
     )
-    if len(selected) < 2:
-        st.info("Pick at least two saved analyses.")
-        return
+    st.plotly_chart(fig, width="stretch")
 
-    rows = []
-    for aid in selected:
-        analysis = get_analysis(aid)
-        summary = analysis["summary"]
-        rows.append({
-            "analysis": labels[aid],
-            "blast": blasts.get(analysis["blast_id"], "unknown"),
-            "particle_count": summary.get("particle_count"),
-            "basis": summary.get("basis"),
-            "unit": summary.get("unit"),
-            "D10": summary.get("D10"),
-            "D50": summary.get("D50"),
-            "D80": summary.get("D80"),
-            "D90": summary.get("D90"),
-            "oversize_pct": summary.get("oversize_pct"),
-            "fines_pct": summary.get("fines_pct"),
-            "rosin_rammler_n": summary.get("rosin_rammler_n"),
-        })
+    st.subheader("Thresholds for the two metrics below")
+    col1, col2 = st.columns(2)
+    with col1:
+        min_target_mm = st.number_input(
+            "Minimum target size (mm) - over-fragmentation is material finer than this",
+            min_value=0.0, value=float(min(summary_a.d_values["D10"], summary_b.d_values["D10"])),
+        )
+    with col2:
+        crusher_gape_mm = st.number_input(
+            "Crusher jaw clearance (mm) - boulders are material coarser than this",
+            min_value=0.0, value=float(max(summary_a.d_values["D90"], summary_b.d_values["D90"])),
+        )
 
-    df = pd.DataFrame(rows)
-    st.dataframe(df, width="stretch", hide_index=True)
+    def kpi_row(name: str, agg: BlastAggregate, summary: AggregateSummary) -> dict:
+        df = agg.combined_df
+        sizes = df["equiv_diameter_mm"].to_numpy()
+        areas = df["area_mm2"].to_numpy()
+        weights = areas if basis is SizeBasis.AREA else None
+        return {
+            "Blast": name,
+            "Images included": len(agg.included),
+            "Particle count": summary.particle_count,
+            "P20 (mm)": summary.d_values["D20"],
+            "P50 (mm)": summary.d_values["D50"],
+            "P80 (mm)": summary.d_values["D80"],
+            "Uniformity index n": summary.rosin_rammler.n if summary.rosin_rammler else None,
+            "Over-fragmentation %": fines_percentage(sizes.tolist(), weights.tolist() if weights is not None else None, min_target_mm, basis),
+            "Boulder / oversize %": oversize_percentage(sizes.tolist(), weights.tolist() if weights is not None else None, crusher_gape_mm, basis),
+        }
+
+    kpi_df = pd.DataFrame([
+        kpi_row(names[blast_a_id], agg_a, summary_a),
+        kpi_row(names[blast_b_id], agg_b, summary_b),
+    ])
+    st.subheader("KPI comparison")
+    st.dataframe(kpi_df.set_index("Blast").T, width="stretch")
 
     st.caption(
-        "Comparisons are only meaningful between analyses using the same weighting basis and, "
-        "ideally, the same segmentation settings - mixed bases are shown above but not blended "
-        "into a single chart."
+        "Uniformity index n is the Rosin-Rammler shape parameter: higher means a narrower, more "
+        "uniform size spread. It shows as blank/NaN when a blast has fewer than 30 pooled "
+        "particles - not enough for a reliable fit. Over-fragmentation and boulder percentages "
+        "use the basis selected above and are not mass or volume fractions. This page reports "
+        "the measured differences without judging which blast is 'better' - that call is yours."
     )
-
-    same_basis = df["basis"].nunique() == 1
-    if same_basis:
-        fig = go.Figure()
-        for metric, color in [("D10", "#7DD3FC"), ("D50", "#38BDF8"), ("D80", "#0EA5E9"), ("D90", "#0369A1")]:
-            fig.add_trace(go.Bar(name=metric, x=df["analysis"], y=df[metric], marker_color=color))
-        fig.update_layout(
-            barmode="group",
-            template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            yaxis_title=f"Size ({df['unit'].iloc[0]})",
-        )
-        st.plotly_chart(fig, width="stretch")
-    else:
-        st.warning("Selected analyses use different weighting bases - showing the table only.")
-
-    st.caption("This tool reports the measured differences without labeling any blast as 'better' - that judgment is yours to make.")
 
 
 # ---------------------------------------------------------------------------
@@ -1785,8 +2145,8 @@ def render_export() -> None:
     st.title("Export")
     blast = get_current_blast()
     image = get_current_image()
-    particles = st.session_state.get("particles")
-    labels = st.session_state.get("label_image")
+    particles = get_particles_for_image(image["id"]) if image else None
+    labels = get_label_image(image["id"]) if image else None
 
     if blast is None or image is None or not particles:
         st.info("Run segmentation and load the Results page first, then come back here to export.")
@@ -1893,7 +2253,8 @@ PAGES = {
     "Calibrate": render_calibrate,
     "Segment & Review": render_segment,
     "Results": render_results,
-    "Compare Blasts": render_compare,
+    "Blast Overview": render_overview,
+    "Blast Comparison": render_comparison,
     "Export": render_export,
 }
 
@@ -1905,5 +2266,27 @@ with st.sidebar:
     st.divider()
     st.caption("Active blast")
     st.write(active_blast["name"] if active_blast else "none selected")
+
+    if active_blast:
+        blast_images = list_images(active_blast["id"])
+        if blast_images:
+            st.caption("Images in Blast Overview")
+            selected = set(st.session_state["selected_image_ids"])
+            for img in blast_images:
+                checked = st.checkbox(
+                    img["original_filename"], value=img["id"] in selected,
+                    key=f"sidebar_include_{img['id']}",
+                )
+                if checked:
+                    selected.add(img["id"])
+                else:
+                    selected.discard(img["id"])
+            st.session_state["selected_image_ids"] = list(selected)
+
+    current_image = get_current_image()
+    if current_image:
+        st.divider()
+        st.caption("Editing")
+        st.write(current_image["original_filename"])
 
 PAGES[choice]()
